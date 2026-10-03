@@ -1,6 +1,6 @@
 # Agent 编排 SDK 的 RAG 执行流程 Demo
 
-一个基于 **LangChain + SiliconFlow API** 的多轮对话 RAG（检索增强生成）演示项目，完整展示了从查询改写、混合检索、RRF 融合、Rerank 精排到阈值拒答的工业级 RAG 流水线。
+一个基于 **LangChain + LangFuse + SiliconFlow API** 的多轮对话 RAG（检索增强生成）演示项目，完整展示了从查询改写、混合检索、RRF 融合、Rerank 精排到阈值拒答的工业级 RAG 流水线。
 
 ## 架构流程
 

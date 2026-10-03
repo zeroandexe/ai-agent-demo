@@ -1,6 +1,6 @@
 # ClangChain
 
-基于 **LangChain + SiliconFlow API** 的大模型应用开发示例仓库，包含完整的 RAG（检索增强生成）执行流程演示。
+基于 **LangChain + LangFuse + SiliconFlow API** 的大模型应用开发示例仓库，包含完整的 RAG（检索增强生成）执行流程演示。
 
 ## 项目简介
 

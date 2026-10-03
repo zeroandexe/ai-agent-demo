@@ -4,10 +4,18 @@
 # 架构: 查询改写(指代消解) -> 混合检索(向量+BM25) -> RRF融合 -> Rerank精排
 #       -> 阈值拒答(代码层短路) -> 带出处生成(原始query+历史)
 #
+# 追踪: Langfuse自托管(http://localhost:3000)，LangChain全链路自动追踪，
+#       裸requests的rerank用@observe手动补span
+
+import os
+
+# ============ Langfuse 追踪配置 ============
+os.environ["LANGFUSE_HOST"] = "http://localhost:3000"
+os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-xxxxxx"    # 替换为Project的Public Key
+os.environ["LANGFUSE_SECRET_KEY"] = "sk-xxxxxx"    # 替换为Project的Secret Key
 
 import math
 import json
-import os
 import sys
 import requests
 import jieba
@@ -24,6 +32,13 @@ from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.runnables import RunnableLambda
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
+
+# Langfuse LangChain回调（自动追踪LCEL全链路）+ 手工追踪装饰器
+from langfuse.langchain import CallbackHandler
+from langfuse import get_client, observe
+
+langfuse = get_client()
+langfuse_handler = CallbackHandler()
 
 # demo采用轨迹流动的api进行验证，langchain已经封装了openai，并且轨迹流动与deepseek等模型提供商都支持openai协议格式。
 SILICONFLOW_API_KEY = "sk-xxxxx"
@@ -136,6 +151,8 @@ def dedup_by_text(docs: List[Document]) -> List[Document]:
     return out
 
 # 使用轨迹流动服务来处理召回块的重新排序，并得到精确核对后的召回块
+# @observe: rerank是裸requests调用，LangChain回调追踪不到，手动补span（含分数，方便在Langfuse里看拒答原因）
+@observe(name="siliconflow-rerank")
 def siliconflow_rerank(query, documents, top_n=3) -> List[Tuple[Optional[float], Document]]:
     if not documents:
         return []
@@ -162,6 +179,8 @@ def siliconflow_rerank(query, documents, top_n=3) -> List[Tuple[Optional[float],
         idx = item["index"]
         if idx < len(documents):
             out.append((item.get("relevance_score"), documents[idx]))
+    # 把分数写进span的metadata，Langfuse界面里直接可见
+    langfuse.update_current_span(metadata={"rerank_scores": [s for s, _ in out]})
     return out[:top_n]
 
 # query重写模板：消除原始query的语义问题
@@ -244,10 +263,13 @@ rag_chain = RunnableWithMessageHistory(
 
 # demo程序入口，演示多轮对话对RAG的使用
 if __name__ == "__main__":
-    config = {"configurable": {"session_id": "demo-001"}}
+    config = {
+        "configurable": {"session_id": "demo-001"},
+        "callbacks": [langfuse_handler],   # Langfuse回调：挂上后整条链路自动上报
+    }
     questions = [
         "什么是 RRF？",
-        "它的公式是什么？",        # 消除指代处理，将转换为：“RRF的公式是什么”，从而精确用户的查询
+        "它的公式是什么？",        # 消除指代处理，将转换为："RRF的公式是什么"，从而精确用户的查询
         "那向量检索和倒排索引有什么区别？", # 这里  "向量检索"、"倒排索引"，两个专用名词会包含精确的信息，非常有利于BM25的检索，同时"区别"能够使LLM找到用户的推理结果期望。
         "Rerank 又是做什么的？",
         "帮我写一首关于秋天的诗",   # 知识库中并包含"秋天"、"诗"这些东西，倒排续检索不过，并且向量检索也不会得到信息，因此在召回率非常低，对于重排序也只能得到非常低的记过，让LLM去回答浪费token，并且也是幻觉。
@@ -258,3 +280,6 @@ if __name__ == "__main__":
         print(f"用户: {q}")
         ans = rag_chain.invoke({"question": q}, config=config)
         print(f"助手: {ans}")
+
+    # 程序退出前flush，确保最后几条trace上报完成
+    langfuse_handler.client.flush()
