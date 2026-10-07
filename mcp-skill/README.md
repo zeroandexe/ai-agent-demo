@@ -1,6 +1,9 @@
-# MCP 改造版 RAG Demo（LangGraph Agent + MCP 检索 Server）
+# MCP + Skill 改造版 RAG Demo（LangGraph Agent + MCP 检索 Server + 低分自救 Skill）
 
-在 [LangGraph-demo](../LangGraph-demo/README.md) 的多 Agent 版 RAG 基础上，将**检索能力整体抽离为 MCP Server**，Agent 侧只保留"编排与推理"，演示如何用 **MCP（Model Context Protocol）** 在 Agent 与检索服务之间解耦。
+在 [LangGraph-demo](../LangGraph-demo/README.md) 的多 Agent 版 RAG 基础上，做两层改造：
+
+1. **检索能力整体抽离为 MCP Server**（见 [mcp_server.py](mcp_server.py)，FastMCP，stdio），Agent 侧只保留"编排与推理"，演示如何用 **MCP（Model Context Protocol）** 在 Agent 与检索服务之间解耦。
+2. **新增低分自救 Skill（rag-rescue）**：检索分数未达阈值时，不再立刻 interrupt 升级人工，而是先按 `skills/rag-rescue/SKILL.md` 手册自动排查修复（改写诊断 / 术语对齐 / HyDE / 子查询拆分），每轮用 MCP 检索工具重检验证，最多 3 轮，全部失败才走原人工介入——演示如何用 **Skill** 将领域排查知识外置到 Markdown，代码零改动即可调整策略。
 
 ## 架构流程
 
@@ -20,7 +23,12 @@ Agent 侧（main.py，LangGraph 编排）          MCP Server 侧（mcp_server.p
 检索 Agent                                  → RRF 融合去重 → 返回候选块
    │  MCP call_tool("rerank")
    ▼ ────────────────────────────────────►  Cross-Encoder 精排 → 返回分数
-人工介入门（Top1 分数 < 0.3 时 interrupt）
+低分自救 Skill（rag-rescue，图内 rescue 循环）
+   │  未达标：读 SKILL.md 选手册策略 → 生成候选查询
+   │  MCP call_tool("hybrid_search") + call_tool("rerank") 重检
+   ├─ 达标 ──────────────► 直达生成
+   └─ 3 轮全败 / GIVE_UP ─► 升级人工介入门
+人工介入门（Top1 分数 < 0.3 且自救失败时 interrupt）
    ▼
 生成 Agent（带出处生成）
    ▼
@@ -38,6 +46,20 @@ Agent 侧（main.py，LangGraph 编排）          MCP Server 侧（mcp_server.p
 | 凭证管理 | Embedding/Rerank/LLM 的 key 都在 main.py | `SILICONFLOW_API_KEY`（检索侧）只存在于 Server 进程，Agent 侧不可见 |
 | 客户端 | 直接函数调用 | FastMCP `Client`：自动拉起 Server、建立会话、`list_tools` 能力发现 |
 | Langfuse 追踪 | LangChain 回调 + `@observe` 补 Rerank span | LLM 走 LangChain 回调；两次 MCP 调用发生在 Server 进程，回调追踪不到，由 Client 侧 `@observe` 手动补 span |
+| 低分兜底 | Top1 < 0.3 直接 interrupt 人工介入 | 先进入 rescue 自救循环：按 SKILL.md 手册选策略（改写诊断/术语对齐/HyDE/子查询拆分）生成候选查询，用 MCP 工具重检，达标直达生成；3 轮全败或 GIVE_UP 才 interrupt |
+
+## 低分自救 Skill（rag-rescue）
+
+定义在 `skills/rag-rescue/SKILL.md`（frontmatter 声明 `name` / `trigger: top1_score < 0.3` / `max_attempts: 3`），并附带 `scripts/extract_terms.py`（jieba TF-IDF 抽取查询关键术语，供术语对齐步骤参考）。
+
+**运行方式**：`main.py` 的 rescue 节点将 SKILL.md 全文加载进 system prompt，user 侧填入现场信息（原始问题 / 改写后查询 / 当前 top1 分数 / jieba 关键词 / 已尝试历史）。模型严格按手册输出约定格式（`策略: xxx` + 候选查询列表），调用方逐条用 MCP 工具重检并回报 top1 分数：
+
+- 每轮只选**一个**策略、给出 1~2 个候选查询；
+- 重检达标 → 图内直达生成，人工无感知；
+- 未达标 → 把本轮"策略 / 查询 / 分数"追加进 `rescue_log`，回灌下一轮决策（已尝试策略不重复）；
+- 连续 3 轮未达标或模型输出 `GIVE_UP` → 升级原人工介入 interrupt。
+
+手册内置 4 个策略（改写诊断 → 术语对齐 → HyDE → 子查询拆分），详见 SKILL.md。**策略顺序与放弃条件只改 Markdown 即可生效，无需改动任何代码。**
 
 ## MCP Server 暴露的能力
 
@@ -56,6 +78,7 @@ Agent 侧（main.py，LangGraph 编排）          MCP Server 侧（mcp_server.p
 - **能力发现**：连接建立后执行 `list_tools`，运行时可打印 Server 实际暴露的工具列表。
 - **降级设计**：Rerank 接口异常时不判分、按传入顺序截取，分数为 `None` 时由人工介入门兜底。
 - **全链路追踪**：LLM 调用经 Langfuse 回调自动上报；MCP 调用跨进程无法被回调捕获，在 Client 侧用 `@observe(name="mcp-hybrid-search")` / `@observe(name="mcp-rerank")` 手动补 span 并写入 query、分数等 metadata。
+- **知识外置（Skill）**：低分排查策略以 SKILL.md 手册形式存放在代码之外，rescue 节点只负责"读手册 → 选手册策略 → 重检验证"的通用循环，调优经验可随时增删改手册而不动代码。
 
 ## 环境依赖
 
@@ -87,6 +110,8 @@ pip install langchain-core langchain-community langchain-classic langchain-silic
 | `REFUSE_THRESHOLD` | 触发人工介入的 Top1 分数阈值，默认 `0.3` |
 | `REFUSE_TEXT` | 拒答文案 |
 | `MAX_GENERATE_RETRY` | 审核打回的最大重试次数，默认 `1` |
+| `MAX_RESCUE_ATTEMPTS` | 低分自救 Skill 的最大自救轮数，默认 `3` |
+| `RESCUE_SKILL_PATH` | 自救手册路径，默认 `skills/rag-rescue/SKILL.md`（相对 main.py） |
 
 ### Langfuse 追踪（可选）
 
@@ -98,7 +123,7 @@ pip install langchain-core langchain-community langchain-classic langchain-silic
 python main.py
 ```
 
-`main.py` 会通过 FastMCP `Client(Path("mcp_server.py"))` 以 stdio 子进程方式自动拉起 Server，无需手动启动。连接建立后会打印发现的工具列表，随后跑与 LangGraph-demo 相同的 5 个演示问题（含一次低分触发的人工介入）。
+`main.py` 会通过 FastMCP `Client(Path("mcp_server.py"))` 以 stdio 子进程方式自动拉起 Server，无需手动启动。连接建立后会打印发现的工具列表，随后跑 6 个演示问题：第 4 题触发低分自救 Skill（HyDE/术语对齐可救回，人工无感知）；第 5 题自救 3 轮全败，升级 interrupt 人工介入；第 6 题被路由 Agent 分流到 chat。
 
 > 调试 Server 也可单独运行 `python mcp_server.py`（阻塞等待 stdio 输入）。
 
@@ -110,6 +135,8 @@ python main.py
 | `mcp_client` | FastMCP Client：以 stdio 子进程拉起 Server，建立会话 |
 | `mcp_hybrid_search` / `mcp_rerank` | Client 侧封装：调用 MCP 工具 + `@observe` 补 Langfuse span |
 | `retrieve_node` | 检索 Agent：连续两次 MCP 调用（混合检索 → Rerank） |
+| `skills/rag-rescue/` | 低分自救 Skill：SKILL.md 手册（策略顺序/放弃条件，知识外置）+ `scripts/extract_terms.py`（jieba 术语抽取） |
+| `rescue_node` | 自救 Skill 节点：加载 SKILL.md 选手册策略、生成候选查询、MCP 重检；达标直达生成，3 轮全败升级人工门 |
 | 其余节点 | 与 LangGraph-demo 一致：router / rewrite / human_gate / refuse / generate / critic / direct_answer |
 
 ## 扩展建议
@@ -117,3 +144,5 @@ python main.py
 - **HTTP 传输**：FastMCP `Client` 同样支持连接远程 HTTP Server，可将检索服务部署为独立远程服务，多个 Agent 共享。
 - **更多检索工具**：在 Server 侧新增 `@mcp.tool()`（如按 category 过滤、全文读取），Agent 侧无需改动编排即可通过 `list_tools` 发现。
 - **Server 侧追踪**：如需观测 Server 内部耗时，可在 `mcp_server.py` 中引入 Langfuse/Python SDK 上报（当前 span 补在 Client 侧）。
+- **更多自救策略**：直接在 `skills/rag-rescue/SKILL.md` 中追加策略（如按 category 过滤检索、多轮 HyDE），rescue 节点按手册通用循环执行，无需改动代码。
+- **更多 Skill**：可仿照 rag-rescue 的模式新增其他 SKILL.md 手册（如生成质量自检、审核打回排查），由对应节点加载手册驱动，实现"经验知识外置、代码保持稳定"。

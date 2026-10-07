@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-# LangGraph 多Agent协作 + 人工介入版 RAG demo —— MCP 改造版（v2：FastMCP Client）
+# LangGraph 多Agent协作 + 人工介入版 RAG demo —— MCP + 低分自救Skill
 #
-# 与原版 LangGraph 的差异：
+# 与原版 main.py 的差异：
 #   - 检索能力整体移入 mcp_server.py（MCP Server，stdio 子进程）：
 #       向量检索 / BM25 / RRF融合去重 / Rerank 精排，及 SILICONFLOW_API_KEY
 #   - 本文件只保留"编排与推理"：路由/改写/生成/审核四个Agent + 人工介入门
 #   - Agent 侧用 FastMCP 自带的 Client 连接 Server
 #   - Langfuse 追踪在 Agent 端：LLM 走 LangChain 回调，两次 MCP 调用用 @observe 手动补 span
+#   - 增"低分自救 Skill"（rag-rescue）：retrieve 与人工门之间插入 rescue 节点，
+#     低分时先按 skills/rag-rescue/SKILL.md 手册自救（最多3轮，每轮一个策略+用MCP工具重检），
+#     全部失败才走原 interrupt。图内原有节点与 human gate 逻辑零改动
 
 import os
 
@@ -17,6 +20,8 @@ os.environ["LANGFUSE_SECRET_KEY"] = "sk-xxxxxx""    # 替换为Project的Secret 
 
 import json
 import asyncio
+import subprocess
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, TypedDict
 
@@ -54,6 +59,11 @@ REFUSE_THRESHOLD = 0.3
 REFUSE_TEXT = "知识库中未找到足够相关的内容，建议咨询对应部门。"
 # 审核Agent判定不合格时允许打回生成的最大次数
 MAX_GENERATE_RETRY = 1
+# 低分自救Skill允许的最大自救轮数，超过后升级人工介入
+MAX_RESCUE_ATTEMPTS = 3
+# 自救Skill文件（知识外置：策略顺序/放弃条件只改 Markdown，不改代码）
+RESCUE_SKILL_PATH = Path(__file__).parent / "skills" / "rag-rescue" / "SKILL.md"
+RESCUE_TERMS_SCRIPT = RESCUE_SKILL_PATH.parent / "scripts" / "extract_terms.py"
 
 # 配置推理模型对象（Agent 侧仅保留生成/判别类 LLM）
 llm = ChatSiliconFlow(
@@ -121,6 +131,33 @@ async def mcp_rerank(query: str, documents: List[Document], top_n: int = 3) -> L
     return out[:top_n]
 
 
+# ============ 低分自救 Skill：知识加载与术语抽取（skill 附带资源） ============
+
+_rescue_skill_text: Optional[str] = None
+
+
+def _load_rescue_skill() -> str:
+    """读取 SKILL.md 全文（演示"知识外置"：playbook 改动无需改代码）。进程内缓存一次。"""
+    global _rescue_skill_text
+    if _rescue_skill_text is None:
+        _rescue_skill_text = RESCUE_SKILL_PATH.read_text(encoding="utf-8")
+    return _rescue_skill_text
+
+
+def _extract_terms(query: str) -> List[str]:
+    """调用 rag-rescue skill 附带的 extract_terms.py（jieba 抽术语），供术语对齐步骤参考。"""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(RESCUE_TERMS_SCRIPT), query],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+    return []
+
+
 # ============ 各Agent使用的提示语 ============
 
 # 路由Agent：判断问题是否需要查知识库，决定走RAG链路还是直接闲聊回答
@@ -162,6 +199,21 @@ critic_prompt = ChatPromptTemplate.from_messages([
     ("human", "用户问题：{question}\n\n答案：{answer}"),
 ])
 
+# 自救Agent：system 放 SKILL.md 全文（知识来自外部文件），user 放现场信息与尝试历史
+rescue_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "你是资深 RAG 检索调优专家。严格遵循以下自救手册（Skill）中规定的策略与放弃条件，"
+     "只允许从手册列出的策略中选择下一步；若策略全部尝试仍未达标，输出 策略: GIVE_UP。\n\n"
+     "{skill}"),
+    ("human",
+     "原始问题: {question}\n"
+     "改写后查询: {rewritten}\n"
+     "当前 top1 分数: {top1}\n"
+     "查询关键词(jieba抽取): {terms}\n"
+     "已尝试记录:\n{history}\n\n"
+     "请给出下一步自救方案。"),
+])
+
 
 # ============ LangGraph 状态定义 ============
 
@@ -177,6 +229,8 @@ class RagState(TypedDict, total=False):
     critic_ok: bool                               # 审核Agent是否通过
     critic_feedback: str                          # 审核不通过的修改意见
     retry_count: int                              # 生成被打回的次数
+    rescue_count: int                             # 自救Skill已尝试的轮数
+    rescue_log: List[str]                         # 每轮自救记录（策略/查询/分数），回灌下一轮决策
 
 
 # ============ 节点（每个节点即一个Agent的职责） ============
@@ -216,8 +270,76 @@ async def retrieve_node(state: RagState):
     return {"retrieved": scored, "top1_score": top1}
 
 
-# 人工介入门：分数达标直接放行；不达标则interrupt挂起整个图，
-# 等待人工决策后从断点续跑（需要checkpointer支持）。
+def _parse_rescue_plan(text: str) -> Tuple[str, List[str]]:
+    """解析自救Agent输出（约定格式：'策略: xxx' + '查询:' 下的列表项），容错处理杂质行。"""
+    strategy, queries = "", []
+    in_query_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(("策略:", "策略：")):
+            strategy = s.split(":", 1)[-1].split("：", 1)[-1].strip()
+            in_query_block = False
+            continue
+        if s.startswith(("查询:", "查询：")):
+            in_query_block = True
+            continue
+        if in_query_block:
+            is_list_item = s[0].isdigit() or s.startswith(("-", "*", "•", "·"))
+            if not is_list_item:
+                in_query_block = False  # 查询块结束，后续为解释性文字
+                continue
+            q = s.lstrip("-*•·0123456789.、) ").strip()
+            if q:
+                queries.append(q)
+    return strategy or "未知策略", queries[:2]
+
+
+# 自救Skill节点（异步）：每次图循环 = 一轮自救尝试。
+# 达标则空转放行；未达标时按 SKILL.md 手册选策略、生成候选查询、用 MCP 工具重检。
+async def rescue_node(state: RagState):
+    top1 = state.get("top1_score")
+    if state.get("retrieved") and top1 is not None and top1 >= REFUSE_THRESHOLD:
+        return {}  # 检索已达标，Skill 不介入，行为与原版一致
+
+    attempt = state.get("rescue_count", 0) + 1
+    history = state.get("rescue_log", [])
+    raw = await (rescue_prompt | llm | StrOutputParser()).ainvoke({
+        "skill": _load_rescue_skill(),
+        "question": state["question"],
+        "rewritten": state["rewritten"],
+        "top1": top1,
+        "terms": "、".join(_extract_terms(state["rewritten"])) or "（无）",
+        "history": "\n".join(history) if history else "（首次尝试）",
+    })
+    strategy, queries = _parse_rescue_plan(raw)
+    print(f"  [自救Skill] 第{attempt}轮 策略={strategy} 候选查询: {queries}")
+
+    if "GIVE_UP" in strategy.upper() or not queries:
+        # 模型判定手册策略已耗尽：直接打满轮数，升级人工介入
+        return {"rescue_count": MAX_RESCUE_ATTEMPTS, "rescue_log": history + [f"第{attempt}轮 策略=GIVE_UP"]}
+
+    best_score, best_scored = top1, state.get("retrieved", [])
+    log = list(history)
+    for q in queries:
+        docs = await mcp_hybrid_search(q)
+        scored = await mcp_rerank(q, docs, top_n=3)
+        s = scored[0][0] if scored else None
+        print(f"  [自救Skill]   重检 '{q}' → top1={s}")
+        log.append(f"第{attempt}轮 策略={strategy} 查询=\"{q}\" → top1={s}")
+        if s is not None and (best_score is None or s > best_score):
+            best_score, best_scored = s, scored
+
+    updates: RagState = {"rescue_count": attempt, "rescue_log": log}
+    if best_score != top1:
+        updates["retrieved"] = best_scored
+        updates["top1_score"] = best_score
+    return updates
+
+
+# 人工介入门：低分自救Skill失败的最终升级路径（rescue节点仅在未达标时才把人送到这里），
+# interrupt挂起整个图，等待人工决策后从断点续跑（需要checkpointer支持）。
 def human_gate_node(state: RagState):
     top1 = state.get("top1_score")
     if state.get("retrieved") and top1 is not None and top1 >= REFUSE_THRESHOLD:
@@ -299,6 +421,16 @@ def route_after_human_gate(state: RagState):
     return "generate"          # pass / force
 
 
+# 自救Skill出口：重检达标直达生成；轮数耗尽升级人工门；否则继续在 rescue 循环下一轮
+def route_after_rescue(state: RagState):
+    top1 = state.get("top1_score")
+    if state.get("retrieved") and top1 is not None and top1 >= REFUSE_THRESHOLD:
+        return "generate"
+    if state.get("rescue_count", 0) >= MAX_RESCUE_ATTEMPTS:
+        return "human_gate"
+    return "rescue"
+
+
 def route_after_critic(state: RagState):
     if state["critic_ok"] or state.get("retry_count", 0) >= MAX_GENERATE_RETRY:
         return END
@@ -311,6 +443,7 @@ builder = StateGraph(RagState)
 builder.add_node("router", router_node)
 builder.add_node("rewrite", rewrite_node)
 builder.add_node("retrieve", retrieve_node)
+builder.add_node("rescue", rescue_node)
 builder.add_node("human_gate", human_gate_node)
 builder.add_node("refuse", refuse_node)
 builder.add_node("generate", generate_node)
@@ -321,7 +454,9 @@ builder.add_edge(START, "router")
 builder.add_conditional_edges("router", route_after_router,
                               {"rewrite": "rewrite", "direct_answer": "direct_answer"})
 builder.add_edge("rewrite", "retrieve")
-builder.add_edge("retrieve", "human_gate")
+builder.add_edge("retrieve", "rescue")
+builder.add_conditional_edges("rescue", route_after_rescue,
+                              {"generate": "generate", "rescue": "rescue", "human_gate": "human_gate"})
 builder.add_conditional_edges("human_gate", route_after_human_gate,
                               {"refuse": "refuse", "retrieve": "retrieve", "generate": "generate"})
 builder.add_edge("refuse", END)
@@ -366,8 +501,9 @@ async def main():
         "什么是 RRF？",
         "它的公式是什么？",
         "那向量检索和倒排索引有什么区别？",
-        "HNSW 索引的查询复杂度是多少？",  # 低分触发人工介入interrupt
-        "帮我写一首关于秋天的诗",           # 路由Agent分流到chat
+        "HNSW 索引的查询复杂度是多少？",        # 触发低分自救Skill（HyDE/术语对齐可救回）
+        "公司食堂周三的菜单是什么？",             # 自救3轮全败 → 人工介入interrupt
+        "帮我写一首关于秋天的诗",                 # 路由Agent分流到chat
     ]
 
     async with mcp_client as session:
@@ -384,7 +520,8 @@ async def main():
                 print(f"用户: {q}")
                 result = await graph.ainvoke(
                     {"question": q, "chat_history": list(history),
-                     "retry_count": 0, "critic_feedback": "", "human_action": ""},
+                     "retry_count": 0, "critic_feedback": "", "human_action": "",
+                     "rescue_count": 0, "rescue_log": []},
                     config=config,
                 )
                 while result.get("__interrupt__"):
